@@ -1,0 +1,8 @@
+{
+  "name": "SentryGuard: Emergency monitoring",
+  "description": "Turns old smartphones into intelligent security cameras that trigger on screams or fire alarms.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
