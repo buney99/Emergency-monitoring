@@ -1,14 +1,19 @@
 import React from 'react';
 import { MonitorConfig } from '../types';
+import { PlayCircle, AlertTriangle } from 'lucide-react';
 
 interface SettingsModalProps {
   isOpen: boolean;
   onClose: () => void;
   config: MonitorConfig;
   setConfig: React.Dispatch<React.SetStateAction<MonitorConfig>>;
+  onTestWebhook?: () => void;
+  onSimulateAlarm?: () => void;
 }
 
-export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, config, setConfig }) => {
+export const SettingsModal: React.FC<SettingsModalProps> = ({ 
+  isOpen, onClose, config, setConfig, onTestWebhook, onSimulateAlarm 
+}) => {
   if (!isOpen) return null;
 
   return (
@@ -30,16 +35,26 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, c
 
           <div>
             <label className="block text-gray-400 text-sm mb-1">Webhook 網址 (POST)</label>
-            <input 
-              type="url" 
-              value={config.webhookUrl}
-              onChange={(e) => setConfig(prev => ({ ...prev, webhookUrl: e.target.value }))}
-              placeholder="https://your-server.com/webhook"
-              className="w-full bg-black border border-gray-700 rounded-lg p-3 text-white focus:border-blue-500 focus:outline-none"
-            />
-            <p className="text-xs text-gray-500 mt-1">
-              支援警報觸發與定時監控快照。
-            </p>
+            <div className="flex gap-2">
+                <input 
+                type="url" 
+                value={config.webhookUrl}
+                onChange={(e) => setConfig(prev => ({ ...prev, webhookUrl: e.target.value }))}
+                placeholder="https://your-server.com/webhook"
+                className="flex-1 bg-black border border-gray-700 rounded-lg p-3 text-white focus:border-blue-500 focus:outline-none"
+                />
+            </div>
+            <div className="flex justify-end mt-2">
+                {onTestWebhook && (
+                    <button 
+                        onClick={onTestWebhook}
+                        disabled={!config.webhookUrl}
+                        className="text-xs px-3 py-1 bg-gray-800 hover:bg-gray-700 text-blue-400 rounded border border-gray-600 transition-colors disabled:opacity-50"
+                    >
+                        測試連線
+                    </button>
+                )}
+            </div>
           </div>
 
           <div>
@@ -73,7 +88,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, c
               <span>關閉</span>
               <span>每 60 分鐘</span>
             </div>
-            <p className="text-xs text-gray-500 mt-1">即使無警報，也會定時發送現場照片至 Webhook 以供監看。</p>
           </div>
 
           <div className="pt-2 border-t border-gray-800">
@@ -86,15 +100,28 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, c
               />
               <span className="text-white">啟用 AI 分析 (Gemini)</span>
             </label>
-            <p className="text-xs text-gray-500 mt-1 ml-8">
-              需要設定環境變數 <code>VITE_GEMINI_API_KEY</code> 才能使用。
-            </p>
           </div>
+
+          {onSimulateAlarm && (
+            <div className="pt-4 border-t border-gray-800">
+               <label className="block text-gray-400 text-sm mb-2">危險操作區域</label>
+               <button 
+                 onClick={onSimulateAlarm}
+                 className="w-full flex items-center justify-center gap-2 py-3 bg-red-900/30 border border-red-800 text-red-400 rounded-lg hover:bg-red-900/50 transition-colors"
+               >
+                 <PlayCircle size={18} />
+                 模擬觸發演練 (Drill)
+               </button>
+               <p className="text-xs text-gray-500 mt-1 text-center">
+                 將直接執行「尖叫偵測」後的警報流程 (含拍照、錄音、上傳)。
+               </p>
+            </div>
+          )}
         </div>
 
         <button 
           onClick={onClose}
-          className="mt-8 w-full bg-white text-black font-bold py-3 rounded-lg hover:bg-gray-200 transition-colors"
+          className="mt-6 w-full bg-white text-black font-bold py-3 rounded-lg hover:bg-gray-200 transition-colors"
         >
           儲存並關閉
         </button>

@@ -6,15 +6,15 @@ export class AudioEngine {
   private stream: MediaStream | null = null;
   private keepAliveOscillator: OscillatorNode | null = null;
   
-  // WAV Recording
-  private recorderNode: ScriptProcessorNode | null = null;
-  private recordedBuffers: Float32Array[] = [];
-  private recordingLength: number = 0;
-  private isRecording: boolean = false;
+  // Circular Buffer for Time-Shift Recording
+  private scriptProcessor: ScriptProcessorNode | null = null;
+  private circularBuffer: Float32Array | null = null;
+  private writeIndex: number = 0;
+  private bufferLength: number = 0; // Total samples in buffer
+  private bufferDurationSeconds: number = 5; // Keep last 5 seconds
   private sampleRate: number = 44100;
 
   async init(stream: MediaStream) {
-    // Close existing if open to prevent duplicates
     if (this.audioContext) {
         this.close();
     }
@@ -22,23 +22,54 @@ export class AudioEngine {
     this.stream = stream;
     this.audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
     
-    // Ensure context is running (fixes issues on some mobile browsers)
     if (this.audioContext.state === 'suspended') {
       await this.audioContext.resume();
     }
 
     this.sampleRate = this.audioContext.sampleRate;
     
+    // 1. Setup Analyser (Visuals & Trigger)
     this.analyser = this.audioContext.createAnalyser();
     this.analyser.fftSize = 512; 
     this.analyser.smoothingTimeConstant = 0.2;
+    this.dataArray = new Uint8Array(this.analyser.frequencyBinCount);
 
     this.microphone = this.audioContext.createMediaStreamSource(stream);
     this.microphone.connect(this.analyser);
-    
-    this.dataArray = new Uint8Array(this.analyser.frequencyBinCount);
 
-    // Keep-alive hack: plays silent audio to prevent iOS/Android from sleeping the audio context
+    // 2. Setup Circular Buffer (Always Recording)
+    // Buffer size = sampleRate * duration
+    this.bufferLength = this.sampleRate * this.bufferDurationSeconds;
+    this.circularBuffer = new Float32Array(this.bufferLength);
+    this.writeIndex = 0;
+
+    // Use ScriptProcessor for raw data access (Works on older devices too)
+    // BufferSize 4096 gives good balance between performance and latency
+    this.scriptProcessor = this.audioContext.createScriptProcessor(4096, 1, 1);
+    
+    this.scriptProcessor.onaudioprocess = (e) => {
+        const inputData = e.inputBuffer.getChannelData(0);
+        
+        // Write to circular buffer
+        for (let i = 0; i < inputData.length; i++) {
+            if (this.circularBuffer) {
+                this.circularBuffer[this.writeIndex] = inputData[i];
+                this.writeIndex = (this.writeIndex + 1) % this.bufferLength;
+            }
+        }
+    };
+
+    // Connect script processor for recording
+    // We connect mic -> scriptProcessor -> muteGain -> destination
+    // This ensures the processing loop runs.
+    const zeroGain = this.audioContext.createGain();
+    zeroGain.gain.value = 0.0;
+    
+    this.microphone.connect(this.scriptProcessor);
+    this.scriptProcessor.connect(zeroGain);
+    zeroGain.connect(this.audioContext.destination);
+
+    // 3. Keep-alive hack
     this.keepAliveOscillator = this.audioContext.createOscillator();
     const gainNode = this.audioContext.createGain();
     gainNode.gain.value = 0.001; 
@@ -88,70 +119,26 @@ export class AudioEngine {
     return { volume: Math.min(100, volumeScore), tonality }; 
   }
 
-  // --- WAV Recording Functions ---
+  /**
+   * Retrieves the audio currently in the circular buffer as a WAV Blob.
+   * capturing the LAST X seconds immediately.
+   */
+  async getAudioBufferBlob(): Promise<Blob | null> {
+    if (!this.circularBuffer || !this.audioContext) return null;
 
-  startRecording() {
-    if (!this.audioContext || !this.microphone) return;
-    if (this.isRecording) return; // Already recording
-
-    this.recordedBuffers = [];
-    this.recordingLength = 0;
-    this.isRecording = true;
-
-    // Use ScriptProcessor
-    this.recorderNode = this.audioContext.createScriptProcessor(4096, 1, 1);
+    // Unroll the circular buffer into a linear buffer
+    // The oldest data is at writeIndex (because we just overwrote the spot before it)
+    const linearBuffer = new Float32Array(this.bufferLength);
     
-    this.recorderNode.onaudioprocess = (e) => {
-      if (!this.isRecording) return;
-      const input = e.inputBuffer.getChannelData(0);
-      const copy = new Float32Array(input);
-      this.recordedBuffers.push(copy);
-      this.recordingLength += copy.length;
-    };
-
-    // Mute destination
-    const zeroGain = this.audioContext.createGain();
-    zeroGain.gain.value = 0.0;
+    // Part 1: From writeIndex to End
+    const part1 = this.circularBuffer.subarray(this.writeIndex);
+    // Part 2: From 0 to writeIndex
+    const part2 = this.circularBuffer.subarray(0, this.writeIndex);
     
-    this.microphone.connect(this.recorderNode);
-    this.recorderNode.connect(zeroGain);
-    zeroGain.connect(this.audioContext.destination);
-  }
+    linearBuffer.set(part1);
+    linearBuffer.set(part2, part1.length);
 
-  async stopRecording(): Promise<Blob | null> {
-    this.isRecording = false;
-    
-    if (this.recorderNode) {
-        this.recorderNode.disconnect();
-        this.recorderNode = null;
-    }
-
-    if (this.recordingLength === 0) {
-        this.recordedBuffers = [];
-        return null;
-    }
-
-    // 1. Flatten buffer
-    const mergedBuffers = this.mergeBuffers(this.recordedBuffers, this.recordingLength);
-    
-    // 2. Encode to WAV
-    const wavBlob = this.encodeWAV(mergedBuffers, this.sampleRate);
-    
-    // Cleanup memory immediately
-    this.recordedBuffers = [];
-    this.recordingLength = 0;
-
-    return wavBlob;
-  }
-
-  private mergeBuffers(buffers: Float32Array[], length: number): Float32Array {
-    const result = new Float32Array(length);
-    let offset = 0;
-    for (const buffer of buffers) {
-      result.set(buffer, offset);
-      offset += buffer.length;
-    }
-    return result;
+    return this.encodeWAV(linearBuffer, this.sampleRate);
   }
 
   private encodeWAV(samples: Float32Array, sampleRate: number): Blob {
@@ -197,8 +184,6 @@ export class AudioEngine {
   }
 
   close() {
-    this.isRecording = false;
-    
     try {
         if (this.keepAliveOscillator) {
             this.keepAliveOscillator.stop();
@@ -213,8 +198,8 @@ export class AudioEngine {
             this.analyser.disconnect();
         }
 
-        if (this.recorderNode) {
-            this.recorderNode.disconnect();
+        if (this.scriptProcessor) {
+            this.scriptProcessor.disconnect();
         }
 
         if (this.audioContext) {
@@ -227,7 +212,8 @@ export class AudioEngine {
     this.audioContext = null;
     this.microphone = null;
     this.analyser = null;
-    this.recorderNode = null;
+    this.scriptProcessor = null;
+    this.circularBuffer = null;
     this.stream = null;
   }
 }

@@ -109,7 +109,7 @@ C. [FALSE_ALARM] (誤報)
     parts.push({ text: prompt });
 
     const response = await ai.models.generateContent({
-      model: 'gemini-2.0-flash', 
+      model: 'gemini-flash-latest', 
       contents: { parts },
       config: {
         systemInstruction: systemInstruction,

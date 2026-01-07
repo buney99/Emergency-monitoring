@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Settings, Activity, Radio, AlertTriangle, Eye, EyeOff, BatteryCharging, Flame, Megaphone, Mic, BrainCircuit, Camera, Ghost } from 'lucide-react';
+import { Settings, Activity, Radio, AlertTriangle, Eye, EyeOff, BatteryCharging, Flame, Megaphone, Mic, BrainCircuit, Camera, Ghost, MapPin, Siren, Zap, ZapOff, PlayCircle } from 'lucide-react';
 import { AppState, MonitorConfig, LogEntry, AlertType } from './types';
 import { AudioEngine } from './services/audioEngine';
 import { SettingsModal } from './components/SettingsModal';
@@ -8,8 +8,8 @@ import { analyzeEventContext } from './services/geminiService';
 
 const CHECK_INTERVAL_MS = 100;
 const CYCLE_INTERVAL_MS = 90000; 
-const TOTAL_PHOTOS = 3;
-const RECORDING_DURATION_MS = 4000; 
+const EMERGENCY_INTERVAL_MS = 120000; // 2 Minutes
+const TOTAL_PHOTOS = 5;
 
 // TRIGGER LOGIC CONSTANTS
 const TRIGGER_TARGET = 100;
@@ -26,7 +26,9 @@ const TYPE_MAPPING: Record<string, string> = {
     'FALSE_ALARM': '誤報',
     'UNKNOWN': '未知',
     'RATE_LIMIT': '配額耗盡',
-    'HEARTBEAT': '定時監控快照'
+    'HEARTBEAT': '定時監控快照',
+    'EMERGENCY': '緊急狀況回報',
+    'TEST': '測試訊號'
 };
 
 export default function App() {
@@ -44,7 +46,10 @@ export default function App() {
   const [audioLevel, setAudioLevel] = useState(0);
   const [showCamera, setShowCamera] = useState(true);
   const [photoCount, setPhotoCount] = useState(0);
-  const [stealthMode, setStealthMode] = useState(false); 
+  const [stealthMode, setStealthMode] = useState(false);
+  const [gpsActive, setGpsActive] = useState(false);
+  const [torchActive, setTorchActive] = useState(false);
+  const [hasTorch, setHasTorch] = useState(false);
   
   // Detection State
   const [fireScore, setFireScore] = useState(0);
@@ -61,6 +66,11 @@ export default function App() {
   const wakeLockRef = useRef<any>(null);
   const lastHeartbeatRef = useRef<number>(Date.now());
   const isMonitoringRef = useRef(false); // Tracks active state for async ops
+  const emergencyTimerRef = useRef<number | null>(null);
+  
+  // GPS Refs
+  const gpsWatchIdRef = useRef<number | null>(null);
+  const gpsLocationRef = useRef<{lat: number, lng: number} | null>(null);
   
   const fireAccRef = useRef(0);
   const screamAccRef = useRef(0);
@@ -93,28 +103,97 @@ export default function App() {
     }, ...prev].slice(0, 50));
   }, []);
 
+  // --- Torch Logic ---
+  const checkTorchCapability = useCallback(() => {
+      if (streamRef.current) {
+          const track = streamRef.current.getVideoTracks()[0];
+          if (track) {
+              const capabilities = track.getCapabilities();
+              // @ts-ignore
+              setHasTorch(!!capabilities.torch);
+          }
+      }
+  }, []);
+
+  const toggleTorch = useCallback(async (forceState?: boolean) => {
+      if (!streamRef.current) return;
+      const track = streamRef.current.getVideoTracks()[0];
+      if (!track) return;
+
+      try {
+          const newState = forceState !== undefined ? forceState : !torchActive;
+          // @ts-ignore
+          await track.applyConstraints({ advanced: [{ torch: newState }] });
+          setTorchActive(newState);
+      } catch (e) {
+          console.warn("Torch toggle failed", e);
+          if (forceState === true) {
+              addLog("無法開啟補光燈 (裝置不支援或被占用)", "error");
+          }
+      }
+  }, [torchActive, addLog]);
+
+  // --- Network Retry Logic ---
+  const uploadWithRetry = useCallback(async (formData: FormData, retries = 3): Promise<any> => {
+      for (let i = 0; i < retries; i++) {
+          try {
+              const response = await fetch(config.webhookUrl, { method: 'POST', body: formData });
+              if (!response.ok) {
+                   throw new Error(`HTTP ${response.status}`);
+              }
+              // If successful, try to parse JSON, but don't fail if empty
+              try {
+                return await response.json();
+              } catch {
+                return {}; 
+              }
+          } catch (e) {
+              const isLast = i === retries - 1;
+              if (isLast) throw e;
+              
+              const delay = 1000 * Math.pow(2, i); // 1s, 2s, 4s...
+              // console.log(`Upload failed, retrying in ${delay}ms...`);
+              await new Promise(res => setTimeout(res, delay));
+          }
+      }
+  }, [config.webhookUrl]);
+
   // --- Remote Configuration Logic ---
   const processRemoteConfig = useCallback((data: any) => {
     if (!data || typeof data !== 'object') return;
     
     // STRICT IDENTITY CHECK
-    // The server MUST echo the correct locationName to confirm it's configuring the right device.
     const currentLocName = config.locationName;
     const receivedLocName = data.locationName;
 
-    if (receivedLocName !== currentLocName) {
-         if (receivedLocName !== undefined) {
-             addLog(`遠端設定拒絕：身分驗證失敗 (收到: '${receivedLocName}' vs 本機: '${currentLocName}')`, "error");
-         }
-         // If missing or mismatch, reject entire config
+    // Optional: Only check identity if locationName is provided in response
+    if (receivedLocName && receivedLocName !== currentLocName) {
+         addLog(`遠端設定拒絕：身分驗證失敗 (收到: '${receivedLocName}')`, "error");
          return; 
     }
 
+    // --- COMMAND HANDLING ---
+    if (data.command) {
+        if ((data.command === 'TRIGGER_ALARM' || data.command === 'TRIGGER_REPORT') && appState !== AppState.EMERGENCY) {
+             addLog("收到遠端指令：啟動緊急模式 (每 2 分鐘回報)", "alert");
+             setAppState(AppState.EMERGENCY);
+             isMonitoringRef.current = true; // Ensure hardware stays on
+             // Auto turn on torch in emergency
+             if (hasTorch) toggleTorch(true);
+        } else if (data.command === 'STOP_ALARM' && appState === AppState.EMERGENCY) {
+             addLog("收到遠端指令：解除緊急模式，回復一般監控。", "success");
+             setAppState(AppState.MONITORING);
+             setConfirmedType(null);
+             // Auto turn off torch
+             if (hasTorch) toggleTorch(false);
+        }
+    }
+
+    // --- CONFIG UPDATE ---
     setConfig(prev => {
         let changed = false;
         const next = { ...prev };
         
-        // Helper to safely update if value exists and is correct type
         const updateIfValid = (key: keyof MonitorConfig, type: string) => {
             if (key in data && typeof data[key] === type) {
                 // @ts-ignore
@@ -126,44 +205,30 @@ export default function App() {
             }
         };
 
-        // EXPLICITLY ALLOWED REMOTE SETTINGS
         updateIfValid('sensitivity', 'number');
         updateIfValid('heartbeatInterval', 'number');
         updateIfValid('webhookUrl', 'string');
         updateIfValid('useGeminiAnalysis', 'boolean');
         
-        // locationName is intentionally NOT updated here, even if it matches.
-        // It acts solely as a verification key.
-
         if (changed) {
-            addLog("收到遠端指令：身分驗證成功，設定已更新。", "success");
+            addLog("設定已透過遠端更新。", "success");
             return next;
         }
         return prev;
     });
-  }, [config.locationName, addLog]);
+  }, [config.locationName, appState, addLog, hasTorch, toggleTorch]);
 
   // Generate the guide JSON string
   const getRemoteControlGuide = useCallback(() => {
     const guide = {
         instruction: `【遠端控制說明】
 1. 本裝置身分 ID 為 '${config.locationName}'。
-2. 安全驗證機制：伺服器回傳的 JSON 設定檔中，必須包含 "locationName": "${config.locationName}" 且完全一致。
-3. 若 locationName 不符或缺失，裝置將拒絕更新任何設定，以防止錯誤覆蓋。
-4. 僅支援修改：sensitivity, heartbeatInterval, useGeminiAnalysis, webhookUrl。`,
+2. 指令 (command):
+   - "TRIGGER_ALARM": 進入緊急模式 (每 2 分鐘回傳，自動開燈)。
+   - "STOP_ALARM": 解除緊急模式 (自動關燈)。`,
         template_to_copy: {
-            locationName: config.locationName, // Required for verification
-            sensitivity: config.sensitivity,
-            heartbeatInterval: config.heartbeatInterval,
-            useGeminiAnalysis: config.useGeminiAnalysis,
-            webhookUrl: config.webhookUrl
-        },
-        field_definitions: {
-            locationName: "字串：必須與本機 ID 完全一致 (驗證用，不可修改)",
-            sensitivity: "整數 (10-90)：數值越高越敏感",
-            heartbeatInterval: "整數 (0-60)：定時快照間隔(分)，0 為關閉",
-            useGeminiAnalysis: "布林值 (true/false)：啟用 AI",
-            webhookUrl: "字串：Server URL"
+            locationName: config.locationName, 
+            command: "TRIGGER_ALARM",
         }
     };
     return JSON.stringify(guide, null, 2);
@@ -183,7 +248,7 @@ export default function App() {
 
   useEffect(() => {
     const handleVisibilityChange = () => {
-      if (document.visibilityState === 'visible' && appState === AppState.MONITORING) {
+      if (document.visibilityState === 'visible' && (appState === AppState.MONITORING || appState === AppState.EMERGENCY)) {
         requestWakeLock();
       }
     };
@@ -202,10 +267,37 @@ export default function App() {
     return new Promise((resolve) => canvas.toBlob((blob) => resolve(blob), 'image/jpeg', 0.8));
   };
 
+  const testWebhook = useCallback(async () => {
+      if (!config.webhookUrl) {
+          addLog("請先輸入 Webhook URL", "error");
+          return;
+      }
+      addLog("正在發送測試訊號...", "info");
+      try {
+          const formData = new FormData();
+          formData.append('alert_type', 'TEST');
+          formData.append('location_name', config.locationName || 'TEST_DEVICE');
+          formData.append('description', '這是一條手動觸發的測試訊息，確認連線是否正常。');
+          formData.append('remote_control_guide', getRemoteControlGuide());
+
+          if (gpsLocationRef.current) {
+              formData.append('latitude', gpsLocationRef.current.lat.toString());
+              formData.append('longitude', gpsLocationRef.current.lng.toString());
+              formData.append('google_maps_link', `https://www.google.com/maps?q=${gpsLocationRef.current.lat},${gpsLocationRef.current.lng}`);
+          }
+
+          const responseData = await uploadWithRetry(formData);
+          addLog("測試成功！Webhook 連線正常。", "success");
+          if (responseData) processRemoteConfig(responseData);
+
+      } catch (e) {
+          addLog("測試失敗：無法連線至 Webhook", "error");
+      }
+  }, [config, addLog, getRemoteControlGuide, processRemoteConfig, uploadWithRetry]);
+
   const sendHeartbeat = useCallback(async () => {
     if (!config.webhookUrl) return;
-    
-    if (appState !== AppState.MONITORING) return;
+    if (appState !== AppState.MONITORING) return; // Do not send heartbeat in EMERGENCY mode
 
     try {
         addLog(`正在發送定時監控快照 (每 ${config.heartbeatInterval} 分鐘)...`, "info");
@@ -214,37 +306,30 @@ export default function App() {
 
         const formData = new FormData();
         formData.append('image', blob, `heartbeat-${Date.now()}.jpg`);
-        formData.append('alert_type', '定時監控快照');
+        formData.append('alert_type', 'HEARTBEAT');
         formData.append('location_name', config.locationName || '未知地點');
         formData.append('description', '系統正常運作中 (定時自動回報)');
         formData.append('cycle_step', '0');
-        
-        // Add Guide
         formData.append('remote_control_guide', getRemoteControlGuide());
 
-        const response = await fetch(config.webhookUrl, { method: 'POST', body: formData });
-        
-        // Check for remote config updates
-        if (response.ok) {
-            try {
-                const responseData = await response.json();
-                processRemoteConfig(responseData);
-            } catch (e) {
-                // Ignore JSON parse errors (server might return text)
-            }
+        if (gpsLocationRef.current) {
+            formData.append('latitude', gpsLocationRef.current.lat.toString());
+            formData.append('longitude', gpsLocationRef.current.lng.toString());
+            formData.append('google_maps_link', `https://www.google.com/maps?q=${gpsLocationRef.current.lat},${gpsLocationRef.current.lng}`);
         }
 
+        const responseData = await uploadWithRetry(formData);
+        if (responseData) processRemoteConfig(responseData);
+        
         addLog("監控快照已傳送。", "success");
     } catch (e) {
         addLog("監控快照傳送失敗 (Webhook Error)。", "error");
     }
-  }, [config, appState, addLog, processRemoteConfig, getRemoteControlGuide]);
+  }, [config, appState, addLog, processRemoteConfig, getRemoteControlGuide, uploadWithRetry]);
 
   // Log enablement when config changes
   useEffect(() => {
     if (config.heartbeatInterval > 0) {
-        // Don't log on every render, strictly dependent on config change
-        // We reset lastHeartbeatRef to now so we don't trigger immediately if the interval was just increased
         lastHeartbeatRef.current = Date.now();
     }
   }, [config.heartbeatInterval]);
@@ -269,32 +354,129 @@ export default function App() {
     return () => clearInterval(timer);
   }, [config.heartbeatInterval, appState, sendHeartbeat]);
 
+  // --- EMERGENCY MODE LOOP ---
+  useEffect(() => {
+    if (appState !== AppState.EMERGENCY) {
+        if (emergencyTimerRef.current) {
+            clearTimeout(emergencyTimerRef.current);
+            emergencyTimerRef.current = null;
+        }
+        return;
+    }
+
+    const performEmergencyReport = async () => {
+        addLog("緊急模式：正在執行週期回報 (2分鐘)...", "alert");
+        try {
+            const imageBlob = await captureImage();
+            // Record 5 seconds of audio
+            await new Promise(resolve => setTimeout(resolve, 5000));
+            const audioBlob = await engineRef.current.getAudioBufferBlob();
+
+            if (config.webhookUrl && imageBlob && isMonitoringRef.current) {
+                const formData = new FormData();
+                formData.append('image', imageBlob, `emergency-${Date.now()}.jpg`);
+                if (audioBlob) {
+                    formData.append('audio', audioBlob, `emergency-${Date.now()}.wav`);
+                }
+                formData.append('alert_type', 'EMERGENCY');
+                formData.append('location_name', config.locationName || '未知地點');
+                formData.append('description', '緊急模式啟動中：定時現場狀況回報');
+                formData.append('remote_control_guide', getRemoteControlGuide());
+
+                if (gpsLocationRef.current) {
+                    formData.append('latitude', gpsLocationRef.current.lat.toString());
+                    formData.append('longitude', gpsLocationRef.current.lng.toString());
+                    formData.append('google_maps_link', `https://www.google.com/maps?q=${gpsLocationRef.current.lat},${gpsLocationRef.current.lng}`);
+                }
+
+                addLog("正在上傳緊急回報 (含重試機制)...", "info");
+                const responseData = await uploadWithRetry(formData);
+                addLog("緊急回報上傳成功。", "success");
+                
+                if (responseData) processRemoteConfig(responseData); // Check for STOP_ALARM
+
+            }
+        } catch (e) {
+            console.error(e);
+            addLog("緊急回報上傳失敗 (已重試)。", "error");
+        }
+
+        // Schedule next run if still in emergency mode
+        if (isMonitoringRef.current) {
+             // @ts-ignore
+             emergencyTimerRef.current = setTimeout(performEmergencyReport, EMERGENCY_INTERVAL_MS);
+        }
+    };
+
+    // Start immediately
+    performEmergencyReport();
+
+    return () => {
+        if (emergencyTimerRef.current) clearTimeout(emergencyTimerRef.current);
+    };
+  }, [appState, config.webhookUrl, config.locationName, addLog, processRemoteConfig, getRemoteControlGuide, uploadWithRetry]);
+
+
+  // Helper to initialize hardware
+  const initHardware = async () => {
+      try {
+        addLog("正在請求麥克風與相機權限...", "info");
+        const stream = await navigator.mediaDevices.getUserMedia({ 
+          audio: true, 
+          video: { facingMode: 'environment' } 
+        });
+        streamRef.current = stream;
+        if (videoRef.current) videoRef.current.srcObject = stream;
+
+        // Check for torch capability immediately after getting stream
+        const track = stream.getVideoTracks()[0];
+        if (track) {
+            const capabilities = track.getCapabilities();
+            // @ts-ignore
+            setHasTorch(!!capabilities.torch);
+        }
+
+        await engineRef.current.init(stream);
+
+        // Start GPS Tracking
+        if ('geolocation' in navigator) {
+            gpsWatchIdRef.current = navigator.geolocation.watchPosition(
+                (position) => {
+                    gpsLocationRef.current = {
+                        lat: position.coords.latitude,
+                        lng: position.coords.longitude
+                    };
+                    if (!gpsActive) setGpsActive(true); 
+                },
+                (error) => {
+                    console.warn("GPS Error", error);
+                    setGpsActive(false);
+                },
+                { enableHighAccuracy: true, maximumAge: 30000, timeout: 27000 }
+            );
+        }
+        
+        await requestWakeLock();
+        return true;
+      } catch (error) {
+        addLog("無法存取感測器，請確認瀏覽器權限設定。", "error");
+        console.error(error);
+        return false;
+      }
+  };
+
   const startMonitoring = async () => {
     if (config.useGeminiAnalysis && !process.env.API_KEY) {
       addLog("警告: 已啟用 AI 分析，但未檢測到環境變數 API Key", "alert");
     }
 
-    try {
-      addLog("正在請求麥克風與相機權限...", "info");
-      const stream = await navigator.mediaDevices.getUserMedia({ 
-        audio: true, 
-        video: { facingMode: 'environment' } 
-      });
-      streamRef.current = stream;
-      if (videoRef.current) videoRef.current.srcObject = stream;
-
-      await engineRef.current.init(stream);
-      
-      setAppState(AppState.MONITORING);
-      isMonitoringRef.current = true;
-      
-      addLog("系統已啟動。監控中...", "success");
-      setLastAnalysis(null);
-      lastHeartbeatRef.current = Date.now();
-      await requestWakeLock();
-    } catch (error) {
-      addLog("無法存取感測器，請確認瀏覽器權限設定。", "error");
-      console.error(error);
+    const success = await initHardware();
+    if (success) {
+        setAppState(AppState.MONITORING);
+        isMonitoringRef.current = true;
+        addLog("系統已啟動。全時監聽與預錄中...", "success");
+        setLastAnalysis(null);
+        lastHeartbeatRef.current = Date.now();
     }
   };
 
@@ -302,11 +484,23 @@ export default function App() {
     isMonitoringRef.current = false;
 
     if (cycleTimeoutRef.current) clearTimeout(cycleTimeoutRef.current);
+    if (emergencyTimerRef.current) clearTimeout(emergencyTimerRef.current);
     
+    // Turn off torch
+    if (torchActive) toggleTorch(false);
+
     if (streamRef.current) {
       streamRef.current.getTracks().forEach(track => track.stop());
       streamRef.current = null;
     }
+
+    if (gpsWatchIdRef.current !== null) {
+        navigator.geolocation.clearWatch(gpsWatchIdRef.current);
+        gpsWatchIdRef.current = null;
+    }
+    setGpsActive(false);
+    setHasTorch(false);
+    setTorchActive(false);
     
     engineRef.current.close();
     
@@ -332,19 +526,13 @@ export default function App() {
   const verifyAlert = useCallback(async (preliminaryType: AlertType) => {
     setAppState(AppState.ANALYZING);
     const chineseType = TYPE_MAPPING[preliminaryType || 'UNKNOWN'];
-    addLog(`偵測到疑似 ${chineseType}。正在進行 AI 驗證...`, "alert");
+    addLog(`偵測到疑似 ${chineseType}。立即回溯擷取前 5 秒音訊...`, "alert");
 
     try {
-        engineRef.current.startRecording();
-        
-        // Wait for recording
-        await new Promise(resolve => setTimeout(resolve, RECORDING_DURATION_MS));
-        
-        // Safety check
-        if (!isMonitoringRef.current) return;
-
-        const audioBlob = await engineRef.current.stopRecording();
+        const audioBlob = await engineRef.current.getAudioBufferBlob();
         const imageBlob = await captureImage();
+
+        if (!isMonitoringRef.current) return;
 
         if (!imageBlob) {
             addLog("相機擷取失敗，重置系統。", "error");
@@ -353,12 +541,11 @@ export default function App() {
         }
 
         if (config.useGeminiAnalysis) {
-            addLog("傳送資料至 Gemini 進行分析...", "info");
+            addLog("傳送資料至 Gemini 進行多模態分析...", "info");
             const analysis = await analyzeEventContext(imageBlob, audioBlob, config.locationName);
             
             if (!isMonitoringRef.current) return;
 
-            // Handle Rate Limits
             if (analysis.category === 'RATE_LIMIT') {
                 addLog(`API 錯誤: ${analysis.description}`, "error");
                 let timeLeft = 60;
@@ -402,7 +589,6 @@ export default function App() {
                 return;
             }
 
-            // Confirmed
             const confirmedChinese = TYPE_MAPPING[analysis.category] || analysis.category;
             setConfirmedType(analysis.category);
             addLog(`AI 確認: ${confirmedChinese} (${analysis.confidence}%). 描述: ${analysis.description}`, "alert");
@@ -420,6 +606,13 @@ export default function App() {
     }
   }, [config, addLog]);
 
+  const simulateAlarm = useCallback(() => {
+      if (appState !== AppState.MONITORING) return;
+      addLog("🧪 啟動演練模式：模擬偵測到求救聲...", "alert");
+      setShowSettings(false); // Close modal
+      setScreamScore(100); // Visual feedback
+      verifyAlert('SCREAM');
+  }, [appState, verifyAlert, addLog]);
 
   const performCycleStep = useCallback(async (
     currentStep: number, 
@@ -433,7 +626,6 @@ export default function App() {
     setAppState(AppState.CYCLE_ACTIVE);
     setPhotoCount(currentStep);
     
-    // 1. Image Logic
     let imageBlob = existingBlob;
     if (!imageBlob || currentStep > 1) {
         imageBlob = await captureImage();
@@ -443,15 +635,14 @@ export default function App() {
       addLog("影像擷取失敗。", "error");
     }
 
-    // 2. Audio Logic
+    // Audio Logic
     let audioBlob = providedAudioBlob;
     if (currentStep > 1) {
         addLog(`週期回報 (${currentStep}/${TOTAL_PHOTOS}): 正在錄製最新現場音...`, "info");
         try {
-            engineRef.current.startRecording();
-            await new Promise(resolve => setTimeout(resolve, RECORDING_DURATION_MS));
+            await new Promise(resolve => setTimeout(resolve, 4000));
             if (!isMonitoringRef.current) return;
-            audioBlob = await engineRef.current.stopRecording();
+            audioBlob = await engineRef.current.getAudioBufferBlob();
         } catch (e) {
             console.warn("Follow-up recording failed", e);
         }
@@ -478,22 +669,17 @@ export default function App() {
             formData.append('location_name', location);
             formData.append('description', description);
             formData.append('cycle_step', currentStep.toString());
-            
-            // Add Guide
             formData.append('remote_control_guide', getRemoteControlGuide());
 
-            const response = await fetch(config.webhookUrl, { method: 'POST', body: formData });
-            
-            // Check for remote config updates
-            if (response.ok) {
-                try {
-                    const responseData = await response.json();
-                    processRemoteConfig(responseData);
-                } catch (e) {
-                     // Ignore JSON parse errors
-                }
+            if (gpsLocationRef.current) {
+                formData.append('latitude', gpsLocationRef.current.lat.toString());
+                formData.append('longitude', gpsLocationRef.current.lng.toString());
+                formData.append('google_maps_link', `https://www.google.com/maps?q=${gpsLocationRef.current.lat},${gpsLocationRef.current.lng}`);
             }
-            
+
+            const responseData = await uploadWithRetry(formData);
+            if (responseData) processRemoteConfig(responseData);
+
             addLog("上傳成功。", "success");
         } catch (e) {
             addLog("上傳失敗。", "error");
@@ -517,7 +703,7 @@ export default function App() {
       setFireScore(0);
       setScreamScore(0);
     }
-  }, [config, addLog, processRemoteConfig, getRemoteControlGuide]);
+  }, [config, addLog, processRemoteConfig, getRemoteControlGuide, uploadWithRetry]);
 
   // Monitoring Loop
   useEffect(() => {
@@ -560,12 +746,10 @@ export default function App() {
     return () => clearInterval(interval);
   }, [appState, config.sensitivity, verifyAlert]);
 
-  // UI Helpers
   const maxScore = Math.max(fireScore, screamScore);
 
   return (
-    <div className="min-h-screen bg-background text-white flex flex-col font-sans relative">
-      {/* Stealth Mode Overlay */}
+    <div className={`min-h-screen bg-background text-white flex flex-col font-sans relative ${appState === AppState.EMERGENCY ? 'border-8 border-red-600' : ''}`}>
       {stealthMode && (
           <div 
             className="fixed inset-0 bg-black z-50 flex flex-col items-center justify-center cursor-pointer select-none"
@@ -575,13 +759,25 @@ export default function App() {
           </div>
       )}
 
-      {/* Header */}
       <header className="p-4 border-b border-gray-800 flex justify-between items-center bg-surface sticky top-0 z-10">
         <div className="flex items-center gap-2">
-          <div className={`w-3 h-3 rounded-full ${appState === AppState.MONITORING ? 'bg-green-500 animate-pulse' : 'bg-gray-500'}`} />
-          <h1 className="font-bold text-lg tracking-tight">SentryGuard 哨兵監控</h1>
+          <div className={`w-3 h-3 rounded-full ${appState === AppState.MONITORING ? 'bg-green-500 animate-pulse' : appState === AppState.EMERGENCY ? 'bg-red-600 animate-ping' : 'bg-gray-500'}`} />
+          <div>
+            <h1 className="font-bold text-lg tracking-tight">SentryGuard 哨兵監控</h1>
+            <span className="text-[10px] text-gray-500 font-mono">v2.2 (Torch Ready)</span>
+          </div>
         </div>
         <div className="flex gap-2">
+            {/* GPS Indicator Icon */}
+            {(appState === AppState.MONITORING || appState === AppState.EMERGENCY) && (
+                <div 
+                  className={`p-2 rounded-full transition ${gpsActive ? 'text-blue-500 bg-blue-900/30' : 'text-gray-600'}`}
+                  title={gpsActive ? "GPS 已定位" : "GPS 搜尋中或未授權"}
+                >
+                    <MapPin size={20} className={!gpsActive ? 'animate-pulse' : ''} />
+                </div>
+            )}
+            
             {appState === AppState.MONITORING && (
                 <button 
                   onClick={() => setStealthMode(true)} 
@@ -597,12 +793,11 @@ export default function App() {
         </div>
       </header>
 
-      {/* Main Content */}
       <main className="flex-1 flex flex-col p-4 max-w-lg mx-auto w-full gap-4">
         
-        {/* Status Card */}
         <div className={`rounded-2xl p-6 text-center border transition-colors duration-500 ${
           appState === AppState.IDLE ? 'border-gray-700 bg-surface' :
+          appState === AppState.EMERGENCY ? 'border-red-600 bg-red-900/60 animate-pulse' :
           appState === AppState.ANALYZING ? 'border-blue-500 bg-blue-900/30' : 
           confirmedType === 'FIRE_ALARM' ? 'border-red-600 bg-red-900/40' :
           confirmedType === 'SCREAM' ? 'border-orange-600 bg-orange-900/40' :
@@ -611,42 +806,37 @@ export default function App() {
         }`}>
           <div className="flex justify-center mb-4">
             {appState === AppState.IDLE && <Radio size={48} className="text-gray-500" />}
-            
-            {/* Monitoring */}
+            {appState === AppState.EMERGENCY && <Siren size={64} className="text-red-500 animate-bounce" />}
             {appState === AppState.MONITORING && maxScore <= 50 && <Activity size={48} className="text-green-500 animate-pulse" />}
             {appState === AppState.MONITORING && maxScore > 50 && <AlertTriangle size={48} className="text-yellow-500 animate-pulse" />}
-            
-            {/* Verifying */}
             {appState === AppState.ANALYZING && <BrainCircuit size={48} className="text-blue-400 animate-pulse" />}
-            
-            {/* Confirmed */}
             {appState === AppState.CYCLE_ACTIVE && confirmedType === 'FIRE_ALARM' && <Flame size={48} className="text-red-500 animate-bounce" />}
             {appState === AppState.CYCLE_ACTIVE && confirmedType === 'SCREAM' && <Megaphone size={48} className="text-orange-500 animate-bounce" />}
           </div>
           
           <h2 className="text-2xl font-bold mb-1">
             {appState === AppState.IDLE && "系統待機"}
+            {appState === AppState.EMERGENCY && "⚠️ 緊急模式啟動 ⚠️"}
             {appState === AppState.MONITORING && maxScore <= 50 && "監控中..."}
             {appState === AppState.MONITORING && maxScore > 50 && (fireScore > screamScore ? '疑似火災警報' : '疑似求救聲')}
-            {appState === AppState.ANALYZING && "AI 分析聲音中..."}
+            {appState === AppState.ANALYZING && "AI 分析中..."}
             {appState === AppState.CYCLE_ACTIVE && (confirmedType === 'FIRE_ALARM' ? "🔥 確認：火災警報" : "🗣️ 確認：人員求救")}
             {appState === AppState.COOLDOWN && "冷卻中"}
           </h2>
           
           <p className="text-gray-400 text-sm font-mono mt-2">
-            {appState === AppState.ANALYZING && "正在錄音並傳送至 Gemini..."}
+            {appState === AppState.EMERGENCY && "持續回報現場狀況 (每2分鐘)..."}
+            {appState === AppState.ANALYZING && "正在進行多模態判讀..."}
             {appState === AppState.CYCLE_ACTIVE && `正在上傳第 ${photoCount}/${TOTAL_PHOTOS} 次回報...`}
             {appState === AppState.MONITORING && `音量: ${Math.round(audioLevel)}% | 火警特徵: ${Math.round(fireScore)}%`}
           </p>
 
-          {/* Feedback for False Alarms */}
           {lastAnalysis && (appState === AppState.MONITORING || appState === AppState.COOLDOWN) && (
             <div className={`mt-4 p-2 rounded-lg text-xs border ${appState === AppState.COOLDOWN ? 'bg-red-900/30 border-red-800 text-red-200' : 'bg-gray-800/50 border-gray-700 text-gray-300'}`}>
                {lastAnalysis}
             </div>
           )}
 
-          {/* Visualizer & Bars */}
           {(appState === AppState.MONITORING || appState === AppState.ANALYZING) && (
             <div className="mt-6 space-y-3">
               <Visualizer level={audioLevel} threshold={config.sensitivity} triggered={maxScore > 0} />
@@ -667,22 +857,30 @@ export default function App() {
           )}
         </div>
 
-        {/* Camera Feed */}
         <div className="relative rounded-2xl overflow-hidden bg-black aspect-video border border-gray-800 shadow-lg">
           <video ref={videoRef} autoPlay playsInline muted className={`w-full h-full object-cover ${!showCamera ? 'opacity-0' : 'opacity-100'}`} />
           {!showCamera && <div className="absolute inset-0 flex items-center justify-center text-gray-500 text-sm">相機運作中 (畫面隱藏)</div>}
           
           {appState === AppState.ANALYZING && (
-              <div className="absolute top-2 left-2 bg-red-600 text-white text-xs px-2 py-1 rounded animate-pulse flex items-center gap-1">
-                  <Mic size={12} /> 錄音中 (4s)
+              <div className="absolute top-2 left-2 bg-blue-600 text-white text-xs px-2 py-1 rounded animate-pulse flex items-center gap-1">
+                  <Mic size={12} /> 分析緩衝音訊
               </div>
           )}
           
-          {/* Heartbeat Indicator (Brief flash) */}
           {config.heartbeatInterval > 0 && appState === AppState.MONITORING && (
                <div className="absolute top-2 right-2 flex items-center gap-1 bg-black/50 text-white/50 text-[10px] px-2 py-1 rounded-full">
                   <Camera size={10} /> 定時監控: {config.heartbeatInterval}m
                </div>
+          )}
+
+          {/* Torch Button */}
+          {hasTorch && (appState === AppState.MONITORING || appState === AppState.EMERGENCY) && (
+             <button 
+               onClick={() => toggleTorch()} 
+               className={`absolute top-2 left-1/2 -translate-x-1/2 p-2 rounded-full backdrop-blur-sm transition ${torchActive ? 'bg-yellow-500/80 text-white' : 'bg-black/50 text-gray-300'}`}
+             >
+                {torchActive ? <Zap size={16} fill="currentColor" /> : <ZapOff size={16} />}
+             </button>
           )}
 
           <button onClick={() => setShowCamera(!showCamera)} className="absolute bottom-2 right-2 bg-black/50 p-2 rounded-full text-white backdrop-blur-sm">
@@ -690,17 +888,15 @@ export default function App() {
           </button>
         </div>
 
-        {/* Action Button */}
         {appState === AppState.IDLE ? (
           <div className="space-y-3">
-            <button onClick={startMonitoring} className="w-full py-4 rounded-xl font-bold text-lg bg-white text-black hover:bg-gray-200 transition active:scale-95 shadow-lg shadow-white/10">啟動監控</button>
+            <button onClick={startMonitoring} className="w-full py-4 rounded-xl font-bold text-lg bg-white text-black hover:bg-gray-200 transition active:scale-95 shadow-lg shadow-white/10">啟動 v2.2 監控</button>
             <div className="flex items-center justify-center gap-2 text-xs text-gray-500"><BatteryCharging size={14} /><span>請連接電源並保持螢幕開啟</span></div>
           </div>
         ) : (
           <button onClick={stopMonitoring} className="w-full py-4 rounded-xl font-bold text-lg bg-red-900/50 text-red-200 border border-red-800 hover:bg-red-900/70 transition active:scale-95">停止監控 / 解除</button>
         )}
 
-        {/* Logs Console */}
         <div className="flex-1 bg-surface border border-gray-800 rounded-2xl p-4 overflow-hidden flex flex-col min-h-[150px]">
           <h3 className="text-xs font-bold text-gray-500 uppercase mb-2 tracking-wider">系統日誌</h3>
           <div className="flex-1 overflow-y-auto space-y-2 pr-1 font-mono text-xs">
@@ -714,7 +910,14 @@ export default function App() {
         </div>
       </main>
 
-      <SettingsModal isOpen={showSettings} onClose={() => setShowSettings(false)} config={config} setConfig={setConfig} />
+      <SettingsModal 
+        isOpen={showSettings} 
+        onClose={() => setShowSettings(false)} 
+        config={config} 
+        setConfig={setConfig} 
+        onTestWebhook={testWebhook}
+        onSimulateAlarm={appState === AppState.MONITORING ? simulateAlarm : undefined}
+      />
     </div>
   );
 }

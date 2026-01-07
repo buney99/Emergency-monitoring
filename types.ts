@@ -4,7 +4,8 @@ export enum AppState {
   CYCLE_ACTIVE = 'CYCLE_ACTIVE', // Replaces RECORDING
   ANALYZING = 'ANALYZING',
   UPLOADING = 'UPLOADING',
-  COOLDOWN = 'COOLDOWN'
+  COOLDOWN = 'COOLDOWN',
+  EMERGENCY = 'EMERGENCY'
 }
 
 export type AlertType = 'FIRE_ALARM' | 'SCREAM' | 'HEARTBEAT' | null;
