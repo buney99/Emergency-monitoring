@@ -256,7 +256,7 @@ export default function App() {
     return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
   }, [appState, requestWakeLock]);
 
-  const captureImage = async (): Promise<Blob | null> => {
+  const captureImage = useCallback(async (): Promise<Blob | null> => {
     if (!videoRef.current) return null;
     const canvas = document.createElement('canvas');
     canvas.width = videoRef.current.videoWidth;
@@ -265,7 +265,7 @@ export default function App() {
     if (!ctx) return null;
     ctx.drawImage(videoRef.current, 0, 0);
     return new Promise((resolve) => canvas.toBlob((blob) => resolve(blob), 'image/jpeg', 0.8));
-  };
+  }, []);
 
   const testWebhook = useCallback(async () => {
       if (!config.webhookUrl) {
@@ -325,7 +325,7 @@ export default function App() {
     } catch (e) {
         addLog("監控快照傳送失敗 (Webhook Error)。", "error");
     }
-  }, [config, appState, addLog, processRemoteConfig, getRemoteControlGuide, uploadWithRetry]);
+  }, [config, appState, addLog, processRemoteConfig, getRemoteControlGuide, uploadWithRetry, captureImage]);
 
   // Log enablement when config changes
   useEffect(() => {
@@ -414,7 +414,7 @@ export default function App() {
     return () => {
         if (emergencyTimerRef.current) clearTimeout(emergencyTimerRef.current);
     };
-  }, [appState, config.webhookUrl, config.locationName, addLog, processRemoteConfig, getRemoteControlGuide, uploadWithRetry]);
+  }, [appState, config.webhookUrl, config.locationName, addLog, processRemoteConfig, getRemoteControlGuide, uploadWithRetry, captureImage]);
 
 
   // Helper to initialize hardware
@@ -604,7 +604,7 @@ export default function App() {
         console.error("Verification failed", e);
         if (isMonitoringRef.current) setAppState(AppState.MONITORING);
     }
-  }, [config, addLog]);
+  }, [config, addLog, captureImage]); // Added captureImage dependency
 
   const simulateAlarm = useCallback(() => {
       if (appState !== AppState.MONITORING) return;
@@ -703,7 +703,7 @@ export default function App() {
       setFireScore(0);
       setScreamScore(0);
     }
-  }, [config, addLog, processRemoteConfig, getRemoteControlGuide, uploadWithRetry]);
+  }, [config, addLog, processRemoteConfig, getRemoteControlGuide, uploadWithRetry, captureImage]); // Added captureImage dependency
 
   // Monitoring Loop
   useEffect(() => {
@@ -858,17 +858,24 @@ export default function App() {
         </div>
 
         <div className="relative rounded-2xl overflow-hidden bg-black aspect-video border border-gray-800 shadow-lg">
-          <video ref={videoRef} autoPlay playsInline muted className={`w-full h-full object-cover ${!showCamera ? 'opacity-0' : 'opacity-100'}`} />
-          {!showCamera && <div className="absolute inset-0 flex items-center justify-center text-gray-500 text-sm">相機運作中 (畫面隱藏)</div>}
+          {/* Video always opaque to ensure frame updates */}
+          <video ref={videoRef} autoPlay playsInline muted className="w-full h-full object-cover opacity-100" />
+          
+          {/* Overlay for hidden camera state - 使用 z-index 蓋住影片，而非隱藏影片本身 */}
+          {!showCamera && (
+            <div className="absolute inset-0 flex items-center justify-center bg-black z-10 text-gray-500 text-sm">
+              相機運作中 (畫面隱藏)
+            </div>
+          )}
           
           {appState === AppState.ANALYZING && (
-              <div className="absolute top-2 left-2 bg-blue-600 text-white text-xs px-2 py-1 rounded animate-pulse flex items-center gap-1">
+              <div className="absolute top-2 left-2 bg-blue-600 text-white text-xs px-2 py-1 rounded animate-pulse flex items-center gap-1 z-20">
                   <Mic size={12} /> 分析緩衝音訊
               </div>
           )}
           
           {config.heartbeatInterval > 0 && appState === AppState.MONITORING && (
-               <div className="absolute top-2 right-2 flex items-center gap-1 bg-black/50 text-white/50 text-[10px] px-2 py-1 rounded-full">
+               <div className="absolute top-2 right-2 flex items-center gap-1 bg-black/50 text-white/50 text-[10px] px-2 py-1 rounded-full z-20">
                   <Camera size={10} /> 定時監控: {config.heartbeatInterval}m
                </div>
           )}
@@ -877,13 +884,13 @@ export default function App() {
           {hasTorch && (appState === AppState.MONITORING || appState === AppState.EMERGENCY) && (
              <button 
                onClick={() => toggleTorch()} 
-               className={`absolute top-2 left-1/2 -translate-x-1/2 p-2 rounded-full backdrop-blur-sm transition ${torchActive ? 'bg-yellow-500/80 text-white' : 'bg-black/50 text-gray-300'}`}
+               className={`absolute top-2 left-1/2 -translate-x-1/2 p-2 rounded-full backdrop-blur-sm transition z-20 ${torchActive ? 'bg-yellow-500/80 text-white' : 'bg-black/50 text-gray-300'}`}
              >
                 {torchActive ? <Zap size={16} fill="currentColor" /> : <ZapOff size={16} />}
              </button>
           )}
 
-          <button onClick={() => setShowCamera(!showCamera)} className="absolute bottom-2 right-2 bg-black/50 p-2 rounded-full text-white backdrop-blur-sm">
+          <button onClick={() => setShowCamera(!showCamera)} className="absolute bottom-2 right-2 bg-black/50 p-2 rounded-full text-white backdrop-blur-sm z-20">
             {showCamera ? <Eye size={16} /> : <EyeOff size={16} />}
           </button>
         </div>
