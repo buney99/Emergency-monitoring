@@ -257,13 +257,49 @@ export default function App() {
   }, [appState, requestWakeLock]);
 
   const captureImage = useCallback(async (): Promise<Blob | null> => {
+    // Strategy 1: Hardware Capture (ImageCapture API)
+    // This is preferred as it bypasses the DOM <video> element freezing issues on Android/Chrome
+    if (streamRef.current && 'ImageCapture' in window) {
+      try {
+        const videoTrack = streamRef.current.getVideoTracks()[0];
+        if (videoTrack && videoTrack.readyState === 'live') {
+          // @ts-ignore
+          const imageCapture = new ImageCapture(videoTrack);
+          // takePhoto() grabs a fresh frame directly from the hardware stream
+          const blob = await imageCapture.takePhoto();
+          return blob;
+        }
+      } catch (e) {
+        console.warn("ImageCapture API failed, falling back to Canvas", e);
+      }
+    }
+
+    // Strategy 2: DOM Canvas Capture (Fallback for iOS/Safari)
     if (!videoRef.current) return null;
+    const video = videoRef.current;
+
+    // Safety: Ensure video is actually playing and has data
+    if (video.paused || video.ended) {
+        try {
+            await video.play();
+        } catch (e) {
+            console.warn("Force play failed", e);
+        }
+    }
+
+    // Check if we have valid dimensions
+    if (video.videoWidth === 0 || video.videoHeight === 0) {
+        return null;
+    }
+
     const canvas = document.createElement('canvas');
-    canvas.width = videoRef.current.videoWidth;
-    canvas.height = videoRef.current.videoHeight;
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
     const ctx = canvas.getContext('2d');
     if (!ctx) return null;
-    ctx.drawImage(videoRef.current, 0, 0);
+    
+    // Draw current video frame
+    ctx.drawImage(video, 0, 0);
     return new Promise((resolve) => canvas.toBlob((blob) => resolve(blob), 'image/jpeg', 0.8));
   }, []);
 
@@ -426,7 +462,13 @@ export default function App() {
           video: { facingMode: 'environment' } 
         });
         streamRef.current = stream;
-        if (videoRef.current) videoRef.current.srcObject = stream;
+        
+        // Ensure video element is connected and playing
+        if (videoRef.current) {
+            videoRef.current.srcObject = stream;
+            // Explicitly play to avoid "paused" state on some browsers
+            videoRef.current.play().catch(e => console.warn("Video auto-play interrupted", e));
+        }
 
         // Check for torch capability immediately after getting stream
         const track = stream.getVideoTracks()[0];
