@@ -341,7 +341,7 @@ export default function App() {
         if (!blob) return;
 
         const formData = new FormData();
-        formData.append('image', blob, `heartbeat-${Date.now()}.jpg`);
+        formData.append('data', blob, `heartbeat-${Date.now()}.jpg`);
         formData.append('alert_type', 'HEARTBEAT');
         formData.append('location_name', config.locationName || '未知地點');
         formData.append('description', '系統正常運作中 (定時自動回報)');
@@ -410,7 +410,7 @@ export default function App() {
 
             if (config.webhookUrl && imageBlob && isMonitoringRef.current) {
                 const formData = new FormData();
-                formData.append('image', imageBlob, `emergency-${Date.now()}.jpg`);
+                formData.append('data', imageBlob, `emergency-${Date.now()}.jpg`);
                 if (audioBlob) {
                     formData.append('audio', audioBlob, `emergency-${Date.now()}.wav`);
                 }
@@ -700,7 +700,7 @@ export default function App() {
             const location = config.locationName || '未知地點';
 
             const formData = new FormData();
-            formData.append('image', imageBlob, `alert-${finalType}-${Date.now()}.jpg`);
+            formData.append('data', imageBlob, `alert-${finalType}-${Date.now()}.jpg`);
             
             if (audioBlob) {
               const ext = 'wav';
