@@ -158,8 +158,105 @@ export default function App() {
       }
   }, [config.webhookUrl]);
 
+  // Generate the guide JSON string
+  const getRemoteControlGuide = useCallback(() => {
+    const guide = {
+        instruction: `【遠端控制說明】
+1. 本裝置身分 ID 為 '${config.locationName}'。
+2. 指令 (command):
+   - "TRIGGER_ALARM": 進入緊急模式 (每 2 分鐘回傳，自動開燈)。
+   - "STOP_ALARM": 解除緊急模式 (自動關燈)。
+   - "RESTART_CAMERA": 軟重啟 (適用：UI 正常但畫面黑屏/凍結，保留系統日誌)。
+   - "RELOAD_PAGE": 硬重整 (適用：瀏覽器崩潰/無回應，徹底釋放記憶體)。`,
+        template_to_copy: {
+            locationName: config.locationName, 
+            command: "RESTART_CAMERA",
+        }
+    };
+    return JSON.stringify(guide, null, 2);
+  }, [config]);
+
+  const requestWakeLock = useCallback(async () => {
+    if ('wakeLock' in navigator) {
+      try {
+        // @ts-ignore
+        wakeLockRef.current = await navigator.wakeLock.request('screen');
+        addLog("螢幕喚醒鎖定已啟用", "success");
+      } catch (err) {
+        console.warn("Wake Lock failed:", err);
+      }
+    }
+  }, [addLog]);
+
+  // Hardware Init Definition (Moved up to be accessible for remote restart logic if needed, 
+  // though RELOAD_PAGE is safer)
+  const initHardware = useCallback(async () => {
+    try {
+      addLog("正在請求麥克風與相機權限...", "info");
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        audio: true, 
+        video: { facingMode: 'environment' } 
+      });
+      streamRef.current = stream;
+      
+      // Ensure video element is connected and playing
+      if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+          // Explicitly play to avoid "paused" state on some browsers
+          videoRef.current.play().catch(e => console.warn("Video auto-play interrupted", e));
+      }
+
+      // Check for torch capability immediately after getting stream
+      const track = stream.getVideoTracks()[0];
+      if (track) {
+          const capabilities = track.getCapabilities();
+          // @ts-ignore
+          setHasTorch(!!capabilities.torch);
+      }
+
+      await engineRef.current.init(stream);
+
+      // Start GPS Tracking
+      if ('geolocation' in navigator) {
+          if (gpsWatchIdRef.current !== null) navigator.geolocation.clearWatch(gpsWatchIdRef.current);
+          
+          gpsWatchIdRef.current = navigator.geolocation.watchPosition(
+              (position) => {
+                  gpsLocationRef.current = {
+                      lat: position.coords.latitude,
+                      lng: position.coords.longitude
+                  };
+                  if (!gpsActive) setGpsActive(true); 
+              },
+              (error) => {
+                  console.warn("GPS Error", error);
+                  setGpsActive(false);
+              },
+              { enableHighAccuracy: true, maximumAge: 30000, timeout: 27000 }
+          );
+      }
+      
+      await requestWakeLock();
+      return true;
+    } catch (error) {
+      addLog("無法存取感測器，請確認瀏覽器權限設定。", "error");
+      console.error(error);
+      return false;
+    }
+  }, [addLog, requestWakeLock, gpsActive]);
+
+  const stopHardware = useCallback(() => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
+    }
+    engineRef.current.close();
+    setHasTorch(false);
+    setTorchActive(false);
+  }, []);
+
   // --- Remote Configuration Logic ---
-  const processRemoteConfig = useCallback((data: any) => {
+  const processRemoteConfig = useCallback(async (data: any) => {
     if (!data || typeof data !== 'object') return;
     
     // STRICT IDENTITY CHECK
@@ -174,6 +271,24 @@ export default function App() {
 
     // --- COMMAND HANDLING ---
     if (data.command) {
+        if (data.command === 'RELOAD_PAGE') {
+            addLog("收到遠端指令：頁面將於 3 秒後強制重新整理 (解決畫面異常)...", "alert");
+            setTimeout(() => {
+                window.location.reload();
+            }, 3000);
+            return;
+        }
+
+        if (data.command === 'RESTART_CAMERA') {
+            addLog("收到遠端指令：正在重啟攝影機串流...", "alert");
+            stopHardware();
+            setTimeout(async () => {
+                const success = await initHardware();
+                if (success) addLog("攝影機已重啟。", "success");
+            }, 1000);
+            return;
+        }
+
         if ((data.command === 'TRIGGER_ALARM' || data.command === 'TRIGGER_REPORT') && appState !== AppState.EMERGENCY) {
              addLog("收到遠端指令：啟動緊急模式 (每 2 分鐘回報)", "alert");
              setAppState(AppState.EMERGENCY);
@@ -216,35 +331,7 @@ export default function App() {
         }
         return prev;
     });
-  }, [config.locationName, appState, addLog, hasTorch, toggleTorch]);
-
-  // Generate the guide JSON string
-  const getRemoteControlGuide = useCallback(() => {
-    const guide = {
-        instruction: `【遠端控制說明】
-1. 本裝置身分 ID 為 '${config.locationName}'。
-2. 指令 (command):
-   - "TRIGGER_ALARM": 進入緊急模式 (每 2 分鐘回傳，自動開燈)。
-   - "STOP_ALARM": 解除緊急模式 (自動關燈)。`,
-        template_to_copy: {
-            locationName: config.locationName, 
-            command: "TRIGGER_ALARM",
-        }
-    };
-    return JSON.stringify(guide, null, 2);
-  }, [config]);
-
-  const requestWakeLock = useCallback(async () => {
-    if ('wakeLock' in navigator) {
-      try {
-        // @ts-ignore
-        wakeLockRef.current = await navigator.wakeLock.request('screen');
-        addLog("螢幕喚醒鎖定已啟用", "success");
-      } catch (err) {
-        console.warn("Wake Lock failed:", err);
-      }
-    }
-  }, [addLog]);
+  }, [config.locationName, appState, addLog, hasTorch, toggleTorch, initHardware, stopHardware]);
 
   useEffect(() => {
     const handleVisibilityChange = () => {
@@ -452,61 +539,6 @@ export default function App() {
     };
   }, [appState, config.webhookUrl, config.locationName, addLog, processRemoteConfig, getRemoteControlGuide, uploadWithRetry, captureImage]);
 
-
-  // Helper to initialize hardware
-  const initHardware = async () => {
-      try {
-        addLog("正在請求麥克風與相機權限...", "info");
-        const stream = await navigator.mediaDevices.getUserMedia({ 
-          audio: true, 
-          video: { facingMode: 'environment' } 
-        });
-        streamRef.current = stream;
-        
-        // Ensure video element is connected and playing
-        if (videoRef.current) {
-            videoRef.current.srcObject = stream;
-            // Explicitly play to avoid "paused" state on some browsers
-            videoRef.current.play().catch(e => console.warn("Video auto-play interrupted", e));
-        }
-
-        // Check for torch capability immediately after getting stream
-        const track = stream.getVideoTracks()[0];
-        if (track) {
-            const capabilities = track.getCapabilities();
-            // @ts-ignore
-            setHasTorch(!!capabilities.torch);
-        }
-
-        await engineRef.current.init(stream);
-
-        // Start GPS Tracking
-        if ('geolocation' in navigator) {
-            gpsWatchIdRef.current = navigator.geolocation.watchPosition(
-                (position) => {
-                    gpsLocationRef.current = {
-                        lat: position.coords.latitude,
-                        lng: position.coords.longitude
-                    };
-                    if (!gpsActive) setGpsActive(true); 
-                },
-                (error) => {
-                    console.warn("GPS Error", error);
-                    setGpsActive(false);
-                },
-                { enableHighAccuracy: true, maximumAge: 30000, timeout: 27000 }
-            );
-        }
-        
-        await requestWakeLock();
-        return true;
-      } catch (error) {
-        addLog("無法存取感測器，請確認瀏覽器權限設定。", "error");
-        console.error(error);
-        return false;
-      }
-  };
-
   const startMonitoring = async () => {
     if (config.useGeminiAnalysis && !process.env.API_KEY) {
       addLog("警告: 已啟用 AI 分析，但未檢測到環境變數 API Key", "alert");
@@ -531,20 +563,13 @@ export default function App() {
     // Turn off torch
     if (torchActive) toggleTorch(false);
 
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(track => track.stop());
-      streamRef.current = null;
-    }
+    stopHardware();
 
     if (gpsWatchIdRef.current !== null) {
         navigator.geolocation.clearWatch(gpsWatchIdRef.current);
         gpsWatchIdRef.current = null;
     }
     setGpsActive(false);
-    setHasTorch(false);
-    setTorchActive(false);
-    
-    engineRef.current.close();
     
     if (wakeLockRef.current) {
       wakeLockRef.current.release();
@@ -806,7 +831,7 @@ export default function App() {
           <div className={`w-3 h-3 rounded-full ${appState === AppState.MONITORING ? 'bg-green-500 animate-pulse' : appState === AppState.EMERGENCY ? 'bg-red-600 animate-ping' : 'bg-gray-500'}`} />
           <div>
             <h1 className="font-bold text-lg tracking-tight">SentryGuard 哨兵監控</h1>
-            <span className="text-[10px] text-gray-500 font-mono">v2.2 (Torch Ready)</span>
+            <span className="text-[10px] text-gray-500 font-mono">v2.3 (Remote Reset)</span>
           </div>
         </div>
         <div className="flex gap-2">
@@ -939,7 +964,7 @@ export default function App() {
 
         {appState === AppState.IDLE ? (
           <div className="space-y-3">
-            <button onClick={startMonitoring} className="w-full py-4 rounded-xl font-bold text-lg bg-white text-black hover:bg-gray-200 transition active:scale-95 shadow-lg shadow-white/10">啟動 v2.2 監控</button>
+            <button onClick={startMonitoring} className="w-full py-4 rounded-xl font-bold text-lg bg-white text-black hover:bg-gray-200 transition active:scale-95 shadow-lg shadow-white/10">啟動 v2.3 監控</button>
             <div className="flex items-center justify-center gap-2 text-xs text-gray-500"><BatteryCharging size={14} /><span>請連接電源並保持螢幕開啟</span></div>
           </div>
         ) : (
