@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Settings, Activity, Radio, AlertTriangle, Eye, EyeOff, BatteryCharging, Flame, Megaphone, Mic, BrainCircuit, Camera, Ghost, MapPin, Siren, Zap, ZapOff, PlayCircle } from 'lucide-react';
 import { AppState, MonitorConfig, LogEntry, AlertType } from './types';
@@ -235,8 +236,13 @@ export default function App() {
     // --- 第二階段：執行指令動作 ---
     if (data.command) {
         if (data.command === 'RELOAD_PAGE') {
-            addLog("執行遠端指令：頁面硬重整...", "alert");
-            setTimeout(() => { window.location.reload(); }, 2000);
+            addLog("執行遠端指令：強制更新頁面版本...", "alert");
+            // 使用時間戳記繞過快取，確保下載到伺服器上的最新版本
+            setTimeout(() => { 
+                const url = new URL(window.location.href);
+                url.searchParams.set('upd', Date.now().toString());
+                window.location.href = url.toString();
+            }, 2000);
             return; 
         }
         if (data.command === 'RESTART_CAMERA') {
@@ -396,7 +402,7 @@ export default function App() {
           <div className={`w-3 h-3 rounded-full ${appState === AppState.MONITORING ? 'bg-green-500 animate-pulse' : appState === AppState.EMERGENCY ? 'bg-red-600 animate-ping' : 'bg-gray-500'}`} />
           <div>
             <h1 className="font-bold text-lg">SentryGuard 哨兵</h1>
-            <span className="text-[10px] text-gray-500 font-mono">v2.6 (Param-First)</span>
+            <span className="text-[10px] text-gray-500 font-mono">v2.7 (Hard-Update)</span>
           </div>
         </div>
         <div className="flex gap-2">
