@@ -13,11 +13,6 @@ const TOTAL_PHOTOS = 5;
 
 // TRIGGER LOGIC CONSTANTS
 const TRIGGER_TARGET = 100;
-const FIRE_GAIN = 10; 
-const FIRE_LOSS = 5; 
-const SCREAM_GAIN = 20; 
-const SCREAM_LOSS = 2; 
-
 const STORAGE_KEY = 'sentry_guard_config';
 const ACTIVE_FLAG_KEY = 'sentry_guard_active';
 
@@ -40,7 +35,7 @@ export default function App() {
     locationName: '',
     sensitivity: 70, 
     useGeminiAnalysis: false,
-    heartbeatInterval: 0 // Default disabled
+    heartbeatInterval: 0 
   });
   const [showSettings, setShowSettings] = useState(false);
   const [logs, setLogs] = useState<LogEntry[]>([]);
@@ -52,31 +47,26 @@ export default function App() {
   const [torchActive, setTorchActive] = useState(false);
   const [hasTorch, setHasTorch] = useState(false);
   
-  // Detection State
   const [fireScore, setFireScore] = useState(0);
   const [screamScore, setScreamScore] = useState(0);
-  const [detectedType, setDetectedType] = useState<AlertType>(null); 
   const [confirmedType, setConfirmedType] = useState<string | null>(null); 
-  const [lastAnalysis, setLastAnalysis] = useState<string | null>(null); 
 
-  // Refs
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const engineRef = useRef<AudioEngine>(new AudioEngine());
   const cycleTimeoutRef = useRef<number | null>(null);
   const wakeLockRef = useRef<any>(null);
   const lastHeartbeatRef = useRef<number>(Date.now());
-  const isMonitoringRef = useRef(false); // Tracks active state for async ops
+  const isMonitoringRef = useRef(false); 
   const emergencyTimerRef = useRef<number | null>(null);
   
-  // GPS Refs
   const gpsWatchIdRef = useRef<number | null>(null);
   const gpsLocationRef = useRef<{lat: number, lng: number} | null>(null);
   
   const fireAccRef = useRef(0);
   const screamAccRef = useRef(0);
 
-  // Load config immediately on mount
+  // Load config on mount
   useEffect(() => {
     const savedConfig = localStorage.getItem(STORAGE_KEY);
     if (savedConfig) {
@@ -84,9 +74,7 @@ export default function App() {
         const parsed = JSON.parse(savedConfig);
         if (parsed.heartbeatInterval === undefined) parsed.heartbeatInterval = 0;
         setConfig(prev => ({ ...prev, ...parsed }));
-      } catch (e) {
-        console.error("Failed to load config", e);
-      }
+      } catch (e) {}
     }
   }, []);
 
@@ -113,10 +101,8 @@ export default function App() {
           // @ts-ignore
           await track.applyConstraints({ advanced: [{ torch: newState }] });
           setTorchActive(newState);
-      } catch (e) {
-          if (forceState === true) addLog("補光燈開啟失敗", "error");
-      }
-  }, [torchActive, addLog]);
+      } catch (e) {}
+  }, [torchActive]);
 
   const uploadWithRetry = useCallback(async (formData: FormData, retries = 3): Promise<any> => {
       for (let i = 0; i < retries; i++) {
@@ -125,20 +111,11 @@ export default function App() {
               if (!response.ok) throw new Error(`HTTP ${response.status}`);
               try { return await response.json(); } catch { return {}; }
           } catch (e) {
-              const isLast = i === retries - 1;
-              if (isLast) throw e;
+              if (i === retries - 1) throw e;
               await new Promise(res => setTimeout(res, 1000 * Math.pow(2, i)));
           }
       }
   }, [config.webhookUrl]);
-
-  const getRemoteControlGuide = useCallback(() => {
-    return JSON.stringify({
-        instruction: "【遠端控制說明】",
-        command: "RELOAD_PAGE (硬重整並自動啟動), RESTART_CAMERA (軟重啟鏡頭)",
-        device: config.locationName
-    });
-  }, [config.locationName]);
 
   const requestWakeLock = useCallback(async () => {
     if ('wakeLock' in navigator) {
@@ -152,11 +129,8 @@ export default function App() {
 
   const initHardware = useCallback(async () => {
     try {
-      addLog("正在請求感測器權限...", "info");
-      const stream = await navigator.mediaDevices.getUserMedia({ 
-        audio: true, 
-        video: { facingMode: 'environment' } 
-      });
+      addLog("正在啟動感測器...", "info");
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: { facingMode: 'environment' } });
       streamRef.current = stream;
       if (videoRef.current) {
           videoRef.current.srcObject = stream;
@@ -179,52 +153,42 @@ export default function App() {
       await requestWakeLock();
       return true;
     } catch (error) {
-      addLog("硬體初始化失敗，請檢查權限。", "error");
+      addLog("感測器初始化失敗。", "error");
       return false;
     }
   }, [addLog, requestWakeLock]);
 
   const stopHardware = useCallback(() => {
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(track => track.stop());
-      streamRef.current = null;
-    }
+    if (streamRef.current) { streamRef.current.getTracks().forEach(t => t.stop()); streamRef.current = null; }
     engineRef.current.close();
     setHasTorch(false);
     setTorchActive(false);
   }, []);
 
   const startMonitoring = useCallback(async (isAutoStart = false) => {
-    if (isAutoStart) {
-        addLog("偵測到自動啟動標記，正在恢復監控...", "alert");
-    }
+    if (isAutoStart) addLog("恢復自動監控中...", "alert");
     const success = await initHardware();
     if (success) {
         setAppState(AppState.MONITORING);
         isMonitoringRef.current = true;
-        localStorage.setItem(ACTIVE_FLAG_KEY, 'true'); // 重要：持久化狀態
-        addLog("系統已啟動。全時監聽與預錄中...", "success");
+        localStorage.setItem(ACTIVE_FLAG_KEY, 'true');
+        addLog("系統已啟動。", "success");
         lastHeartbeatRef.current = Date.now();
     } else {
         localStorage.setItem(ACTIVE_FLAG_KEY, 'false');
     }
   }, [initHardware, addLog]);
 
-  // AUTO-RESUME EFFECT: 處理 RELOAD_PAGE 後的自動啟動
   useEffect(() => {
-      const savedState = localStorage.getItem(ACTIVE_FLAG_KEY);
-      if (savedState === 'true') {
-          // 給予一點延遲確保 DOM 和 Config 已就緒
-          const timer = setTimeout(() => {
-              startMonitoring(true);
-          }, 1500);
+      if (localStorage.getItem(ACTIVE_FLAG_KEY) === 'true') {
+          const timer = setTimeout(() => startMonitoring(true), 1500);
           return () => clearTimeout(timer);
       }
   }, [startMonitoring]);
 
   const stopMonitoring = () => {
     isMonitoringRef.current = false;
-    localStorage.setItem(ACTIVE_FLAG_KEY, 'false'); // 重要：手動停止需清除狀態
+    localStorage.setItem(ACTIVE_FLAG_KEY, 'false');
     if (cycleTimeoutRef.current) clearTimeout(cycleTimeoutRef.current);
     if (emergencyTimerRef.current) clearTimeout(emergencyTimerRef.current);
     if (torchActive) toggleTorch(false);
@@ -234,32 +198,52 @@ export default function App() {
     if (wakeLockRef.current) wakeLockRef.current.release();
     setAppState(AppState.IDLE);
     setStealthMode(false);
-    addLog("系統已解除武裝 (停用)。", "info");
-    setAudioLevel(0);
-    setFireScore(0);
-    setScreamScore(0);
+    addLog("系統已停用。", "info");
+    setAudioLevel(0); setFireScore(0); setScreamScore(0);
   };
 
   const processRemoteConfig = useCallback(async (data: any) => {
     if (!data || typeof data !== 'object') return;
-    if (data.locationName && data.locationName !== config.locationName) return;
+    
+    // 身份校驗：如果回應帶有名稱但與本地不符，則忽略（除非本地名稱為空）
+    if (data.locationName && config.locationName && data.locationName !== config.locationName) {
+        addLog(`忽略來自 '${data.locationName}' 的遠端指令。`, "error");
+        return;
+    }
 
+    // --- 第一階段：更新設定參數 ---
+    let updatedConfig: MonitorConfig | null = null;
+    setConfig(prev => {
+        const next = { ...prev };
+        let changed = false;
+        const keys: (keyof MonitorConfig)[] = ['sensitivity', 'heartbeatInterval', 'webhookUrl', 'useGeminiAnalysis', 'locationName'];
+        keys.forEach(k => {
+            if (k in data && data[k] !== prev[k]) {
+                // @ts-ignore
+                next[k] = data[k]; changed = true;
+            }
+        });
+        if (changed) {
+            updatedConfig = next;
+            addLog("遠端參數已更新 (靈敏度/心跳/名稱)。", "success");
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(next)); // 強制同步到存儲
+            return next;
+        }
+        return prev;
+    });
+
+    // --- 第二階段：執行指令動作 ---
     if (data.command) {
         if (data.command === 'RELOAD_PAGE') {
-            addLog("收到遠端指令：頁面將於 3 秒後硬重整...", "alert");
-            setTimeout(() => { window.location.reload(); }, 3000);
-            return;
+            addLog("執行遠端指令：頁面硬重整...", "alert");
+            setTimeout(() => { window.location.reload(); }, 2000);
+            return; 
         }
         if (data.command === 'RESTART_CAMERA') {
-            addLog("收到遠端指令：正在軟重啟鏡頭...", "alert");
+            addLog("執行遠端指令：重啟鏡頭...", "alert");
             stopHardware();
-            setTimeout(async () => {
-                const success = await initHardware();
-                if (success) addLog("鏡頭已恢復。", "success");
-            }, 1000);
-            return;
-        }
-        if ((data.command === 'TRIGGER_ALARM') && appState !== AppState.EMERGENCY) {
+            setTimeout(async () => { if (await initHardware()) addLog("鏡頭已恢復。", "success"); }, 1000);
+        } else if (data.command === 'TRIGGER_ALARM' && appState !== AppState.EMERGENCY) {
              setAppState(AppState.EMERGENCY);
              isMonitoringRef.current = true;
              if (hasTorch) toggleTorch(true);
@@ -268,23 +252,6 @@ export default function App() {
              if (hasTorch) toggleTorch(false);
         }
     }
-
-    setConfig(prev => {
-        let changed = false;
-        const next = { ...prev };
-        const updateIfValid = (key: keyof MonitorConfig, type: string) => {
-            if (key in data && typeof data[key] === type && data[key] !== prev[key]) {
-                // @ts-ignore
-                next[key] = data[key]; changed = true;
-            }
-        };
-        updateIfValid('sensitivity', 'number');
-        updateIfValid('heartbeatInterval', 'number');
-        updateIfValid('webhookUrl', 'string');
-        updateIfValid('useGeminiAnalysis', 'boolean');
-        if (changed) { addLog("遠端設定已更新。", "success"); return next; }
-        return prev;
-    });
   }, [config.locationName, appState, addLog, hasTorch, toggleTorch, initHardware, stopHardware]);
 
   const captureImage = useCallback(async (): Promise<Blob | null> => {
@@ -314,12 +281,11 @@ export default function App() {
         formData.append('data', blob, `hb.jpg`);
         formData.append('alert_type', 'HEARTBEAT');
         formData.append('location_name', config.locationName);
-        formData.append('remote_control_guide', getRemoteControlGuide());
         const responseData = await uploadWithRetry(formData);
         if (responseData) processRemoteConfig(responseData);
         addLog("監控快照已傳送。", "success");
     } catch (e) {}
-  }, [config, appState, addLog, processRemoteConfig, getRemoteControlGuide, uploadWithRetry, captureImage]);
+  }, [config, appState, addLog, processRemoteConfig, uploadWithRetry, captureImage]);
 
   useEffect(() => {
     if (config.heartbeatInterval <= 0) return;
@@ -337,7 +303,7 @@ export default function App() {
 
   const verifyAlert = useCallback(async (type: AlertType) => {
     setAppState(AppState.ANALYZING);
-    addLog(`偵測到疑似特徵，啟動 AI 判讀...`, "alert");
+    addLog(`偵測疑似特徵，啟動 AI 判讀...`, "alert");
     try {
         const audioBlob = await engineRef.current.getAudioBufferBlob();
         const imageBlob = await captureImage();
@@ -421,32 +387,32 @@ export default function App() {
     <div className={`min-h-screen bg-background text-white flex flex-col relative ${appState === AppState.EMERGENCY ? 'border-8 border-red-600' : ''}`}>
       {stealthMode && (
           <div className="fixed inset-0 bg-black z-50 flex flex-col items-center justify-center cursor-pointer" onDoubleClick={() => setStealthMode(false)}>
-             <div className="text-gray-900 text-xs font-mono">STEALTH MONITORING ACTIVE</div>
+             <div className="text-gray-900 text-[10px] font-mono tracking-widest">GUARD ACTIVE</div>
           </div>
       )}
 
-      <header className="p-4 border-b border-gray-800 flex justify-between items-center bg-surface sticky top-0 z-10">
+      <header className="p-4 border-b border-gray-800 flex justify-between items-center bg-surface sticky top-0 z-10 shadow-lg">
         <div className="flex items-center gap-2">
           <div className={`w-3 h-3 rounded-full ${appState === AppState.MONITORING ? 'bg-green-500 animate-pulse' : appState === AppState.EMERGENCY ? 'bg-red-600 animate-ping' : 'bg-gray-500'}`} />
           <div>
             <h1 className="font-bold text-lg">SentryGuard 哨兵</h1>
-            <span className="text-[10px] text-gray-500 font-mono">v2.5 (Reliable Auto-Resume)</span>
+            <span className="text-[10px] text-gray-500 font-mono">v2.6 (Param-First)</span>
           </div>
         </div>
         <div className="flex gap-2">
             {appState === AppState.MONITORING && (
-                <button onClick={() => setStealthMode(true)} className="p-2 bg-gray-800 rounded-full text-gray-400">
+                <button onClick={() => setStealthMode(true)} className="p-2 bg-gray-800 rounded-full text-gray-400 active:scale-95 transition-transform">
                     <Ghost size={20} />
                 </button>
             )}
-            <button onClick={() => setShowSettings(true)} className="p-2 bg-gray-800 rounded-full">
+            <button onClick={() => setShowSettings(true)} className="p-2 bg-gray-800 rounded-full active:scale-95 transition-transform">
               <Settings size={20} />
             </button>
         </div>
       </header>
 
       <main className="flex-1 flex flex-col p-4 max-w-lg mx-auto w-full gap-4">
-        <div className={`rounded-2xl p-6 text-center border transition-all ${
+        <div className={`rounded-2xl p-6 text-center border transition-all duration-300 ${
           appState === AppState.IDLE ? 'border-gray-800 bg-surface' :
           appState === AppState.EMERGENCY ? 'border-red-600 bg-red-900/60' :
           'border-green-900 bg-green-900/10'
@@ -459,34 +425,34 @@ export default function App() {
           </div>
           <h2 className="text-2xl font-bold mb-1">
             {appState === AppState.IDLE && "待機中"}
-            {appState === AppState.EMERGENCY && "緊急回報模式"}
+            {appState === AppState.EMERGENCY && "緊急報警中"}
             {appState === AppState.MONITORING && "守護中"}
-            {appState === AppState.ANALYZING && "AI 分析判讀中"}
+            {appState === AppState.ANALYZING && "AI 判讀中"}
           </h2>
           <Visualizer level={audioLevel} threshold={config.sensitivity} triggered={fireScore > 0 || screamScore > 0} />
         </div>
 
-        <div className="relative rounded-2xl overflow-hidden bg-black aspect-video border border-gray-800">
+        <div className="relative rounded-2xl overflow-hidden bg-black aspect-video border border-gray-800 shadow-xl">
           <video ref={videoRef} autoPlay playsInline muted className="w-full h-full object-cover" />
-          {!showCamera && <div className="absolute inset-0 bg-black flex items-center justify-center text-gray-700 text-xs">監控持續運作中 (雙擊隱形模式關閉)</div>}
+          {!showCamera && <div className="absolute inset-0 bg-black flex items-center justify-center text-gray-700 text-xs">監控正常運作</div>}
           {hasTorch && appState !== AppState.IDLE && (
-             <button onClick={() => toggleTorch()} className={`absolute top-2 left-1/2 -translate-x-1/2 p-2 rounded-full ${torchActive ? 'bg-yellow-500 text-white' : 'bg-black/50 text-gray-300'}`}>
+             <button onClick={() => toggleTorch()} className={`absolute top-2 left-1/2 -translate-x-1/2 p-2 rounded-full shadow-lg ${torchActive ? 'bg-yellow-500 text-white' : 'bg-black/50 text-gray-300'}`}>
                 {torchActive ? <Zap size={16} fill="currentColor" /> : <ZapOff size={16} />}
              </button>
           )}
-          <button onClick={() => setShowCamera(!showCamera)} className="absolute bottom-2 right-2 bg-black/50 p-2 rounded-full">
+          <button onClick={() => setShowCamera(!showCamera)} className="absolute bottom-2 right-2 bg-black/50 p-2 rounded-full shadow-lg">
             {showCamera ? <Eye size={16} /> : <EyeOff size={16} />}
           </button>
         </div>
 
         {appState === AppState.IDLE ? (
-          <button onClick={() => startMonitoring(false)} className="w-full py-4 rounded-xl font-bold text-lg bg-white text-black hover:bg-gray-200 active:scale-[0.98] transition-all shadow-lg">啟動哨兵監控</button>
+          <button onClick={() => startMonitoring(false)} className="w-full py-4 rounded-xl font-bold text-lg bg-white text-black hover:bg-gray-200 active:scale-[0.98] transition-all shadow-xl">啟動哨兵</button>
         ) : (
-          <button onClick={stopMonitoring} className="w-full py-4 rounded-xl font-bold text-lg bg-red-900/50 text-red-200 border border-red-800 hover:bg-red-900/70 transition-all">停止監控 / 解除</button>
+          <button onClick={stopMonitoring} className="w-full py-4 rounded-xl font-bold text-lg bg-red-900/50 text-red-200 border border-red-800 hover:bg-red-900/70 active:scale-[0.98] transition-all">停止監控</button>
         )}
 
-        <div className="flex-1 bg-surface border border-gray-800 rounded-2xl p-4 overflow-hidden flex flex-col min-h-[120px]">
-          <h3 className="text-[10px] font-bold text-gray-500 uppercase mb-2">系統運作日誌</h3>
+        <div className="flex-1 bg-surface border border-gray-800 rounded-2xl p-4 overflow-hidden flex flex-col min-h-[140px]">
+          <h3 className="text-[10px] font-bold text-gray-600 uppercase mb-2">系統日誌 (Device: {config.locationName})</h3>
           <div className="flex-1 overflow-y-auto space-y-1 font-mono text-[10px] text-gray-500">
             {logs.map(log => (
               <div key={log.id} className={`${log.type === 'error' ? 'text-red-400' : log.type === 'alert' ? 'text-yellow-400' : log.type === 'success' ? 'text-green-400' : ''}`}>
